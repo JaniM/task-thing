@@ -68,3 +68,29 @@ impl TaskStore {
         self.tasks.get_mut(&id).expect("Task doesn't exist")
     }
 }
+
+#[derive(Debug, Default)]
+pub struct Filter {
+    pub title: String,
+    pub status: Option<Status>,
+}
+
+impl Filter {
+    pub fn apply(&self, store: &TaskStore) -> Vec<TaskId> {
+        let mut results = Vec::new();
+
+        for task in store.tasks.values() {
+            if !task.title.contains(&self.title) {
+                continue;
+            }
+            if let Some(status) = self.status {
+                if task.status != status {
+                    continue;
+                }
+            }
+            results.push(task.id);
+        }
+
+        results
+    }
+}

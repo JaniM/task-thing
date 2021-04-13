@@ -21,7 +21,7 @@ use tui::{
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use task::{TaskId, TaskStore};
+use task::{Filter, TaskId, TaskStore};
 
 #[derive(Debug, Default)]
 struct AppData {
@@ -116,6 +116,7 @@ impl TaskView {
 struct QuickInput {
     title: String,
     text: String,
+    continuous: bool,
 }
 
 impl QuickInput {
@@ -123,11 +124,17 @@ impl QuickInput {
         Self {
             title: title.into(),
             text: String::new(),
+            continuous: false,
         }
     }
 
     fn text(mut self, text: String) -> Self {
         self.text = text;
+        self
+    }
+
+    fn continuous(mut self) -> Self {
+        self.continuous = true;
         self
     }
 
@@ -144,10 +151,41 @@ impl QuickInput {
     }
 }
 
+#[derive(Debug, Default)]
+struct QuickSelect {
+    title: String,
+    choices: Vec<(char, String)>,
+}
+
+impl QuickSelect {
+    fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            choices: Vec::new(),
+        }
+    }
+
+    fn choices(mut self, choices: impl IntoIterator<Item = (char, impl Into<String>)>) -> Self {
+        self.choices
+            .extend(choices.into_iter().map(|x| (x.0, x.1.into())));
+        self
+    }
+
+    fn show(&self, _data: &AppData) -> Paragraph {
+        let mut spans = vec![Span::from(self.title.as_str()), Span::from(": ")];
+        for (key, text) in &self.choices {
+            spans.push(Span::raw(format!("[{}] {} ", key, text)));
+        }
+        let text = Paragraph::new(vec![Spans::from(spans)]);
+        text
+    }
+}
+
 #[derive(Debug)]
 enum AppState {
     Normal,
     Input(QuickInput),
+    Select(QuickSelect),
 }
 
 impl Default for AppState {
@@ -171,6 +209,8 @@ impl Default for Pane {
 #[derive(Debug)]
 enum Command {
     QuickNew,
+    SetFilter,
+    SelectFilter,
     SetDescription(TaskId),
     Text(String),
 }
@@ -181,11 +221,12 @@ struct Tasker {
     state: AppState,
     pane: Pane,
     data: AppData,
+    filter: Filter,
     commands: Vec<Command>,
 }
 
 impl Tasker {
-    fn execute_command(&mut self) {
+    fn execute_command(&mut self, done: bool) {
         match self.commands.get(0) {
             Some(Command::QuickNew) => {
                 if let Some(Command::Text(text)) = self.commands.get(1) {
@@ -201,9 +242,46 @@ impl Tasker {
                     task.description = text.clone();
                 }
             }
+            Some(Command::SetFilter) => {
+                if let Some(Command::Text(text)) = self.commands.get(1) {
+                    self.filter.title = text.clone();
+                    self.tasklist.tasks = self.filter.apply(&self.data.store);
+                    self.tasklist.selection = 0;
+                    self.tasklist.list_state = Default::default();
+                }
+            }
+            Some(Command::SelectFilter) => {
+                if let Some(Command::Text(text)) = self.commands.get(1) {
+                    if text == "Title" {
+                        self.commands.clear();
+                        self.commands.push(Command::SetFilter);
+                        self.state = AppState::Input(
+                            QuickInput::new("Filter [Title]")
+                                .text(self.filter.title.clone())
+                                .continuous(),
+                        );
+                        return;
+                    }
+                    if text == "Todo" {
+                        self.filter.status = Some(task::Status::Todo);
+                    }
+                    if text == "Done" {
+                        self.filter.status = Some(task::Status::Done);
+                    }
+                    if text == "Clear" {
+                        self.filter = Filter::default();
+                    }
+                    self.tasklist.tasks = self.filter.apply(&self.data.store);
+                    self.tasklist.selection = 0;
+                    self.tasklist.list_state = Default::default();
+                    self.state = AppState::Normal;
+                }
+            }
             _ => {}
         }
-        self.commands.clear();
+        if done {
+            self.commands.clear();
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -227,6 +305,15 @@ impl Tasker {
                 }
                 if matches!(self.pane, Pane::Main) {
                     match key.code {
+                        KeyCode::Char('f') => {
+                            self.commands.push(Command::SelectFilter);
+                            *state = AppState::Select(QuickSelect::new("Filter").choices(vec![
+                                ('t', "Title"),
+                                ('d', "Todo"),
+                                ('D', "Done"),
+                                ('c', "Clear"),
+                            ]));
+                        }
                         KeyCode::Up => {
                             self.tasklist.selection = self.tasklist.selection.saturating_sub(1);
                         }
@@ -264,15 +351,41 @@ impl Tasker {
                 }
             }
             AppState::Input(input) => {
+                let mut send = false;
                 if let KeyCode::Char(c) = key.code {
                     input.text.push(c);
+                    send = true;
                 }
                 if key.code == KeyCode::Backspace {
                     input.text.pop();
+                    send = true;
                 }
-                if key.code == KeyCode::Enter {
+                if send && input.continuous {
+                    if let Some(Command::Text(_)) = self.commands.last() {
+                        self.commands.pop();
+                    }
                     self.commands.push(Command::Text(input.text.clone()));
-                    self.execute_command();
+                    self.execute_command(false);
+                } else if key.code == KeyCode::Enter {
+                    self.commands.push(Command::Text(input.text.clone()));
+                    self.execute_command(true);
+                    self.state = AppState::Normal;
+                }
+
+                if key.code == KeyCode::Esc {
+                    self.commands.clear();
+                    self.state = AppState::Normal;
+                }
+            }
+            AppState::Select(input) => {
+                if let KeyCode::Char(c) = key.code {
+                    if let Some(choice) = input.choices.iter().find(|x| x.0 == c) {
+                        self.commands.push(Command::Text(choice.1.clone()));
+                        self.execute_command(true);
+                    }
+                }
+                if key.code == KeyCode::Esc {
+                    self.commands.clear();
                     self.state = AppState::Normal;
                 }
             }
@@ -307,6 +420,11 @@ impl Tasker {
                 f.render_widget(text, chunks[1]);
                 f.set_cursor(chunks[1].left() + pos, chunks[1].top());
             }
+
+            if let AppState::Select(input) = &self.state {
+                let text = input.show(&self.data);
+                f.render_widget(text, chunks[1]);
+            }
         })?;
 
         Ok(())
@@ -327,7 +445,10 @@ fn event_loop(mut terminal: Terminal<impl Backend>) -> CResult<()> {
                 Event::Resize(w, h) => {
                     tasker.data.window_size = (w, h);
                 }
-                Event::Key(k) if k == KeyCode::Esc.into() => {
+                Event::Key(k)
+                    if k.code == KeyCode::Char('c')
+                        && k.modifiers == crossterm::event::KeyModifiers::CONTROL =>
+                {
                     break;
                 }
                 Event::Key(key) => {
