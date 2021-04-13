@@ -28,6 +28,7 @@ pub struct Task {
     pub title: String,
     pub description: String,
     pub status: Status,
+    pub links: Vec<TaskId>,
 }
 
 impl Task {
@@ -55,6 +56,7 @@ impl TaskStore {
             title: String::new(),
             description: String::new(),
             status: Status::default(),
+            links: Default::default(),
         };
         self.tasks.insert(id, task);
         self.tasks.get_mut(&id).unwrap()
