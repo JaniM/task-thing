@@ -12,12 +12,14 @@ use crossterm::{
 
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Terminal,
+    text::{Span, Spans, Text},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
 };
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use task::{TaskId, TaskStore};
 
@@ -25,6 +27,13 @@ use task::{TaskId, TaskStore};
 struct AppData {
     store: TaskStore,
     window_size: (u16, u16),
+}
+
+fn status_to_span(status: task::Status) -> Span<'static> {
+    match status {
+        task::Status::Todo => Span::styled("TODO", Style::default().add_modifier(Modifier::BOLD)),
+        task::Status::Done => Span::styled("DONE", Style::default().add_modifier(Modifier::DIM)),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -39,56 +48,106 @@ impl TaskList {
         self.tasks.get(self.selection).copied()
     }
 
-    fn show(&mut self, data: &AppData) -> (List, &mut ListState) {
+    fn show<'a>(&mut self, data: &'a AppData, frame: &mut Frame<impl Backend>, size: Rect) {
         // ui::rectangle(stdout, 0, 0, 80, 20)?;
         let mut items = vec![];
         for id in &self.tasks {
             let mut spans = vec![];
             let task = data.store.get_task(*id);
-            match task.status {
-                task::Status::Todo => {
-                    spans.push(Span::styled(
-                        "TODO ",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
-                }
-                task::Status::Done => {
-                    spans.push(Span::styled(
-                        "DONE ",
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                }
-            }
-            spans.push(Span::raw(task.title.clone()));
+            spans.push(status_to_span(task.status));
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(&task.title));
             items.push(ListItem::new(vec![Spans::from(spans)]));
         }
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::all()).title("Tasks"))
-            .highlight_style(Style::default().bg(Color::DarkGray));
+        let block = Block::default().borders(Borders::TOP).title(" Tasks ");
+        let inner = block.inner(size);
+        frame.render_widget(block, size);
+        let chunks = Layout::default()
+            .horizontal_margin(1)
+            .constraints([Constraint::Min(0)])
+            .split(inner);
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
         self.list_state.select(Some(self.selection));
-        (list, &mut self.list_state)
+        frame.render_stateful_widget(list, chunks[0], &mut self.list_state);
+    }
+}
+
+#[derive(Debug)]
+struct TaskView {
+    task_id: TaskId,
+}
+
+impl TaskView {
+    fn new(task_id: TaskId) -> Self {
+        Self { task_id }
+    }
+
+    fn show<'a>(&'a self, data: &'a AppData, frame: &mut Frame<impl Backend>, size: Rect) {
+        let task = data.store.get_task(self.task_id);
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .title(Spans::from(vec![
+                Span::from(" "),
+                Span::from(task.title.as_str()),
+                Span::from(" "),
+            ]));
+        frame.render_widget(block, size);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(size);
+
+        let text = vec![Spans::from(vec![
+            Span::from("Status: "),
+            status_to_span(task.status),
+        ])];
+        let text = Paragraph::new(text);
+        frame.render_widget(text, chunks[0]);
+
+        let description = Text::raw(task.description.as_str());
+        let paragraph = Paragraph::new(description).wrap(Wrap { trim: true });
+        frame.render_widget(paragraph, chunks[1]);
     }
 }
 
 #[derive(Debug, Default)]
-struct TaskInput {
+struct QuickInput {
     title: String,
+    text: String,
 }
 
-impl TaskInput {
+impl QuickInput {
+    fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            text: String::new(),
+        }
+    }
+
+    fn text(mut self, text: String) -> Self {
+        self.text = text;
+        self
+    }
+
     fn show(&self, _data: &AppData) -> (Paragraph, u16) {
         let text = Paragraph::new(vec![Spans::from(vec![
-            Span::from("Title: "),
             Span::from(self.title.as_str()),
+            Span::from(": "),
+            Span::from(self.text.as_str()),
         ])]);
-        (text, self.title.len() as u16 + 7)
+        (
+            text,
+            self.text.graphemes(true).count() as u16 + self.title.len() as u16 + 2,
+        )
     }
 }
 
 #[derive(Debug)]
 enum AppState {
     Normal,
-    Input(TaskInput),
+    Input(QuickInput),
 }
 
 impl Default for AppState {
@@ -97,10 +156,10 @@ impl Default for AppState {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum Pane {
     Main,
-    OneTask(TaskId),
+    OneTask(TaskView),
 }
 
 impl Default for Pane {
@@ -109,23 +168,65 @@ impl Default for Pane {
     }
 }
 
+#[derive(Debug)]
+enum Command {
+    QuickNew,
+    SetDescription(TaskId),
+    Text(String),
+}
+
 #[derive(Debug, Default)]
 struct Tasker {
     tasklist: TaskList,
     state: AppState,
     pane: Pane,
     data: AppData,
+    commands: Vec<Command>,
 }
 
 impl Tasker {
+    fn execute_command(&mut self) {
+        match self.commands.get(0) {
+            Some(Command::QuickNew) => {
+                if let Some(Command::Text(text)) = self.commands.get(1) {
+                    let task = self.data.store.new_task();
+                    task.title = text.clone();
+                    self.tasklist.tasks.push(task.id);
+                    self.tasklist.selection = self.tasklist.tasks.len() - 1;
+                }
+            }
+            Some(Command::SetDescription(id)) => {
+                if let Some(Command::Text(text)) = self.commands.get(1) {
+                    let task = self.data.store.get_task_mut(*id);
+                    task.description = text.clone();
+                }
+            }
+            _ => {}
+        }
+        self.commands.clear();
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         match &mut self.state {
             state @ AppState::Normal => {
-                if self.pane == Pane::Main {
-                    match key.code {
-                        KeyCode::Char('n') => {
-                            *state = AppState::Input(TaskInput::default());
+                match key.code {
+                    KeyCode::Char('n') => {
+                        self.commands.push(Command::QuickNew);
+                        *state = AppState::Input(QuickInput::new("Title"));
+                    }
+                    KeyCode::Char('e') => {
+                        if let Some(id) = self.tasklist.selection() {
+                            let task = self.data.store.get_task(id);
+                            self.commands.push(Command::SetDescription(id));
+                            *state = AppState::Input(
+                                QuickInput::new("Description").text(task.description.clone()),
+                            );
                         }
+                    }
+                    _ => {}
+                }
+                if matches!(self.pane, Pane::Main) {
+                    match key.code {
                         KeyCode::Up => {
                             self.tasklist.selection = self.tasklist.selection.saturating_sub(1);
                         }
@@ -136,7 +237,7 @@ impl Tasker {
                         }
                         KeyCode::Enter => {
                             if let Some(id) = self.tasklist.selection() {
-                                self.pane = Pane::OneTask(id);
+                                self.pane = Pane::OneTask(TaskView::new(id));
                             }
                         }
                         KeyCode::Char(' ') => {
@@ -155,9 +256,6 @@ impl Tasker {
                     }
                 } else {
                     match key.code {
-                        KeyCode::Char('n') => {
-                            *state = AppState::Input(TaskInput::default());
-                        }
                         KeyCode::Enter => {
                             self.pane = Pane::Main;
                         }
@@ -167,14 +265,15 @@ impl Tasker {
             }
             AppState::Input(input) => {
                 if let KeyCode::Char(c) = key.code {
-                    input.title.push(c);
+                    input.text.push(c);
+                }
+                if key.code == KeyCode::Backspace {
+                    input.text.pop();
                 }
                 if key.code == KeyCode::Enter {
-                    let task = self.data.store.new_task();
-                    task.title = input.title.clone();
-                    self.tasklist.tasks.push(task.id);
+                    self.commands.push(Command::Text(input.text.clone()));
+                    self.execute_command();
                     self.state = AppState::Normal;
-                    self.tasklist.selection = self.tasklist.tasks.len() - 1;
                 }
             }
         }
@@ -187,8 +286,21 @@ impl Tasker {
                 .constraints([Constraint::Min(2), Constraint::Length(1)])
                 .split(f.size());
 
-            let (list, state) = self.tasklist.show(&self.data);
-            f.render_stateful_widget(list, chunks[0], state);
+            match &self.pane {
+                Pane::Main => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(2), Constraint::Length(5)])
+                        .split(chunks[0]);
+                    self.tasklist.show(&self.data, f, chunks[0]);
+                    if let Some(id) = self.tasklist.selection() {
+                        TaskView::new(id).show(&self.data, f, chunks[1]);
+                    }
+                }
+                Pane::OneTask(view) => {
+                    view.show(&self.data, f, chunks[0]);
+                }
+            }
 
             if let AppState::Input(input) = &self.state {
                 let (text, pos) = input.show(&self.data);

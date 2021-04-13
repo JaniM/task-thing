@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// A correct-by-construction id for tasks. Can not be constructed for non-existing tasks.
-#[derive(Debug, Copy, Clone, Default, Hash, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub struct TaskId(u64);
 
 impl TaskId {
@@ -22,10 +22,11 @@ impl Default for Status {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Task {
     pub id: TaskId,
     pub title: String,
+    pub description: String,
     pub status: Status,
 }
 
@@ -51,7 +52,9 @@ impl TaskStore {
         let id = TaskId(self.id_counter);
         let task = Task {
             id,
-            ..Task::default()
+            title: String::new(),
+            description: String::new(),
+            status: Status::default(),
         };
         self.tasks.insert(id, task);
         self.tasks.get_mut(&id).unwrap()
