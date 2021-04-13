@@ -4,6 +4,12 @@ use std::collections::HashMap;
 #[derive(Debug, Copy, Clone, Default, Hash, Eq, PartialEq)]
 pub struct TaskId(u64);
 
+impl TaskId {
+    pub fn id(&self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Status {
     Todo,

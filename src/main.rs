@@ -1,18 +1,22 @@
 mod task;
-mod ui;
 
-use std::{
-    io::{stdout, Stdout, Write},
-    time::Duration,
-};
+use std::{io::stdout, time::Duration};
 
 use crossterm::{
     cursor,
     event::{poll, read, Event, KeyCode, KeyEvent},
-    execute, queue,
-    style::{self, Colorize, Print, Styler},
+    execute,
     terminal::{self, disable_raw_mode, enable_raw_mode},
     Result as CResult,
+};
+
+use tui::{
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Span, Spans},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Terminal,
 };
 
 use task::{TaskId, TaskStore};
@@ -27,6 +31,7 @@ struct AppData {
 struct TaskList {
     tasks: Vec<TaskId>,
     selection: usize,
+    list_state: ListState,
 }
 
 impl TaskList {
@@ -34,47 +39,34 @@ impl TaskList {
         self.tasks.get(self.selection).copied()
     }
 
-    fn show(&self, stdout: &mut Stdout, data: &AppData) -> CResult<()> {
+    fn show(&mut self, data: &AppData) -> (List, &mut ListState) {
         // ui::rectangle(stdout, 0, 0, 80, 20)?;
-        let (w, h) = data.window_size;
-        for (i, id) in self.tasks.iter().enumerate() {
+        let mut items = vec![];
+        for id in &self.tasks {
+            let mut spans = vec![];
             let task = data.store.get_task(*id);
-            if i == self.selection {
-                queue!(
-                    stdout,
-                    style::SetBackgroundColor(style::Color::DarkGrey),
-                    cursor::MoveTo(1, i as u16 + 1),
-                    Print(" ".repeat(w as usize - 2))
-                )?;
-            }
-            queue!(stdout, cursor::MoveTo(2, i as u16 + 1))?;
             match task.status {
                 task::Status::Todo => {
-                    queue!(
-                        stdout,
-                        style::SetAttribute(style::Attribute::Bold),
-                        Print("TODO "),
-                        style::SetAttribute(style::Attribute::Reset)
-                    )?;
+                    spans.push(Span::styled(
+                        "TODO ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
                 }
                 task::Status::Done => {
-                    queue!(
-                        stdout,
-                        style::SetAttribute(style::Attribute::Dim),
-                        Print("DONE "),
-                        style::SetAttribute(style::Attribute::Reset)
-                    )?;
+                    spans.push(Span::styled(
+                        "DONE ",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
                 }
             }
-            if i == self.selection {
-                queue!(stdout, style::SetBackgroundColor(style::Color::DarkGrey),)?;
-            }
-            queue!(stdout, Print(&task.title))?;
-            if i == self.selection {
-                queue!(stdout, style::ResetColor)?;
-            }
+            spans.push(Span::raw(task.title.clone()));
+            items.push(ListItem::new(vec![Spans::from(spans)]));
         }
-        Ok(())
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::all()).title("Tasks"))
+            .highlight_style(Style::default().bg(Color::DarkGray));
+        self.list_state.select(Some(self.selection));
+        (list, &mut self.list_state)
     }
 }
 
@@ -84,14 +76,12 @@ struct TaskInput {
 }
 
 impl TaskInput {
-    fn show(&self, stdout: &mut Stdout, data: &AppData) -> CResult<()> {
-        queue!(
-            stdout,
-            cursor::MoveTo(0, data.window_size.1 - 1),
-            Print("Title: "),
-            Print(&self.title)
-        )?;
-        Ok(())
+    fn show(&self, _data: &AppData) -> (Paragraph, u16) {
+        let text = Paragraph::new(vec![Spans::from(vec![
+            Span::from("Title: "),
+            Span::from(self.title.as_str()),
+        ])]);
+        (text, self.title.len() as u16 + 7)
     }
 }
 
@@ -119,11 +109,6 @@ impl Default for Pane {
     }
 }
 
-#[derive(Debug)]
-enum UserInput {
-    NewTask,
-}
-
 #[derive(Debug, Default)]
 struct Tasker {
     tasklist: TaskList,
@@ -133,7 +118,7 @@ struct Tasker {
 }
 
 impl Tasker {
-    fn handle_key(&mut self, key: KeyEvent) -> CResult<()> {
+    fn handle_key(&mut self, key: KeyEvent) {
         match &mut self.state {
             state @ AppState::Normal => {
                 if self.pane == Pane::Main {
@@ -145,7 +130,7 @@ impl Tasker {
                             self.tasklist.selection = self.tasklist.selection.saturating_sub(1);
                         }
                         KeyCode::Down => {
-                            if self.tasklist.selection < self.tasklist.tasks.len() - 1 {
+                            if self.tasklist.selection + 1 < self.tasklist.tasks.len() {
                                 self.tasklist.selection += 1;
                             }
                         }
@@ -159,6 +144,12 @@ impl Tasker {
                                 let task = self.data.store.get_task_mut(id);
                                 task.toggle_status();
                             }
+                        }
+                        KeyCode::Char('m') => {
+                            let task = self.data.store.new_task();
+                            task.title = task.id.id().to_string();
+                            self.tasklist.tasks.push(task.id);
+                            self.tasklist.selection = self.tasklist.tasks.len() - 1;
                         }
                         _ => {}
                     }
@@ -182,47 +173,39 @@ impl Tasker {
                     let task = self.data.store.new_task();
                     task.title = input.title.clone();
                     self.tasklist.tasks.push(task.id);
-                    self.state = AppState::Normal
+                    self.state = AppState::Normal;
+                    self.tasklist.selection = self.tasklist.tasks.len() - 1;
                 }
             }
         }
-
-        Ok(())
     }
 
-    fn show(&self, stdout: &mut Stdout) -> CResult<()> {
-        execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
-        match self.pane {
-            Pane::Main => {
-                self.tasklist.show(stdout, &self.data)?;
-            }
-            Pane::OneTask(id) => {
-                let list = TaskList {
-                    tasks: vec![id],
-                    selection: 1,
-                };
-                list.show(stdout, &self.data)?;
-            }
-        }
+    fn show(&mut self, terminal: &mut Terminal<impl Backend>) -> CResult<()> {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(2), Constraint::Length(1)])
+                .split(f.size());
 
-        if let AppState::Input(input) = &self.state {
-            queue!(stdout, cursor::Show)?;
-            input.show(stdout, &self.data)?;
-        } else {
-            queue!(stdout, cursor::Hide)?;
-        }
+            let (list, state) = self.tasklist.show(&self.data);
+            f.render_stateful_widget(list, chunks[0], state);
 
-        stdout.flush()?;
+            if let AppState::Input(input) = &self.state {
+                let (text, pos) = input.show(&self.data);
+                f.render_widget(text, chunks[1]);
+                f.set_cursor(chunks[1].left() + pos, chunks[1].top());
+            }
+        })?;
 
         Ok(())
     }
 }
 
-fn event_loop() -> CResult<()> {
+fn event_loop(mut terminal: Terminal<impl Backend>) -> CResult<()> {
     let mut tasker = Tasker::default();
     tasker.data.window_size = terminal::size()?;
     loop {
-        tasker.show(&mut stdout())?;
+        tasker.show(&mut terminal)?;
         // Wait up to 1s for another event
         if poll(Duration::from_millis(1_000))? {
             // It's guaranteed that read() wont block if `poll` returns `Ok(true)`
@@ -236,7 +219,7 @@ fn event_loop() -> CResult<()> {
                     break;
                 }
                 Event::Key(key) => {
-                    tasker.handle_key(key)?;
+                    tasker.handle_key(key);
                 }
                 _ => {}
             }
@@ -250,7 +233,10 @@ fn main() -> CResult<()> {
     enable_raw_mode()?;
     execute!(stdout(), terminal::EnterAlternateScreen)?;
 
-    if let Err(e) = event_loop() {
+    let backend = CrosstermBackend::new(stdout());
+    let terminal = Terminal::new(backend)?;
+
+    if let Err(e) = event_loop(terminal) {
         println!("Error: {:?}\r", e);
     }
 
