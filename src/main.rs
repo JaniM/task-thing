@@ -1,3 +1,4 @@
+mod automaton;
 mod task;
 
 use std::{io::stdout, time::Duration};
@@ -21,6 +22,7 @@ use tui::{
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use automaton::*;
 use task::{Filter, TaskId, TaskStore};
 
 #[derive(Debug, Default)]
@@ -154,7 +156,6 @@ impl TaskView {
 struct QuickInput {
     title: String,
     text: String,
-    continuous: bool,
 }
 
 impl QuickInput {
@@ -162,17 +163,11 @@ impl QuickInput {
         Self {
             title: title.into(),
             text: String::new(),
-            continuous: false,
         }
     }
 
     fn text(mut self, text: String) -> Self {
         self.text = text;
-        self
-    }
-
-    fn continuous(mut self) -> Self {
-        self.continuous = true;
         self
     }
 
@@ -217,25 +212,11 @@ impl QuickSelect {
         Paragraph::new(vec![Spans::from(spans)])
     }
 }
+
 #[derive(Debug)]
 struct Search {
     filter: Filter,
     list: TaskList,
-    input: QuickInput,
-}
-
-#[derive(Debug)]
-enum AppState {
-    Normal,
-    Input(QuickInput),
-    Select(QuickSelect),
-    Search(Search),
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        AppState::Normal
-    }
 }
 
 #[derive(Debug)]
@@ -250,283 +231,560 @@ impl Default for Pane {
     }
 }
 
-#[derive(Debug)]
-enum Command {
-    QuickNew,
-    SetFilter,
-    SelectFilter,
-    AddLink,
-    SetDescription(TaskId),
-    Text(String),
+enum Action {
+    Key(KeyEvent),
+}
+
+struct NormalState;
+
+impl State for NormalState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = ();
+    type Return = ();
+
+    fn act(
+        &mut self,
+        data: &mut Self::Data,
+        action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        let Action::Key(key) = action;
+        match key.code {
+            KeyCode::Char('n') => {
+                return self.push(QuickCreateState);
+            }
+            KeyCode::Char('f') => {
+                return self.push(SetFilterState);
+            }
+            KeyCode::Up => {
+                data.tasklist.selection = data.tasklist.selection.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if data.tasklist.selection + 1 < data.tasklist.tasks.len() {
+                    data.tasklist.selection += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(id) = data.tasklist.selection() {
+                    return self.transition(OneTaskState(id));
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(id) = data.tasklist.selection() {
+                    let task = data.data.store.get_task_mut(id);
+                    task.toggle_status();
+                }
+            }
+            KeyCode::Char('m') => {
+                let task = data.data.store.new_task();
+                task.title = task.id.id().to_string();
+                data.tasklist.tasks.push(task.id);
+                data.tasklist.selection = data.tasklist.tasks.len() - 1;
+            }
+            KeyCode::Char('e') => {
+                if let Some(id) = data.tasklist.selection() {
+                    return self.push(SetDescriptionState(id));
+                }
+            }
+            _ => {}
+        }
+        ActResult::Nothing
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        data.pane = Pane::Main;
+        ActResult::Nothing
+    }
+}
+
+struct OneTaskState(TaskId);
+
+impl State for OneTaskState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = ();
+    type Return = ();
+
+    fn act(
+        &mut self,
+        data: &mut Self::Data,
+        action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        let view = match &mut data.pane {
+            Pane::OneTask(view) => view,
+            _ => panic!("Wrong pane"),
+        };
+
+        let Action::Key(key) = action;
+
+        match key.code {
+            KeyCode::Esc => {
+                return self.transition(NormalState);
+            }
+            KeyCode::Char('n') => {
+                return self.push(QuickCreateState);
+            }
+            KeyCode::Up => {
+                view.link_list.selection = view.link_list.selection.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if view.link_list.selection + 1 < view.link_list.tasks.len() {
+                    view.link_list.selection += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(id) = view.link_list.selection() {
+                    return self.transition(OneTaskState(id));
+                }
+            }
+            KeyCode::Char(' ') => {
+                let task = data.data.store.get_task_mut(view.task_id);
+                task.toggle_status();
+            }
+            KeyCode::Char('l') => {
+                return self.push(AddLinkState(self.0));
+            }
+            KeyCode::Char('e') => {
+                return self.push(SetDescriptionState(self.0));
+            }
+            _ => {}
+        }
+
+        ActResult::Nothing
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        data.pane = Pane::OneTask(TaskView::new(self.0, &data.data, true));
+        ActResult::Nothing
+    }
+}
+
+struct AddLinkState(TaskId);
+
+impl State for AddLinkState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = Option<TaskId>;
+    type Return = ();
+
+    fn act(
+        &mut self,
+        _data: &mut Self::Data,
+        _action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        panic!("AddLinkState shouldn't receive actions");
+    }
+
+    fn resume(
+        &mut self,
+        data: &mut Self::Data,
+        value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        if let Some(oid) = value {
+            let id = self.0;
+            let task = data.data.store.get_task_mut(id);
+            task.links.push(oid);
+            let other_task = data.data.store.get_task_mut(oid);
+            other_task.links.push(id);
+
+            let view = match &mut data.pane {
+                Pane::OneTask(view) => view,
+                _ => panic!("Wrong pane"),
+            };
+            view.link_list.tasks.push(oid);
+        }
+
+        self.pop(())
+    }
+
+    fn on_enter(&mut self, _data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        self.push(SearchTaskState {
+            title: "Link a task".to_owned(),
+        })
+    }
+}
+
+struct SearchTaskState {
+    title: String,
+}
+
+impl State for SearchTaskState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = ();
+    type Return = Option<TaskId>;
+
+    fn act(
+        &mut self,
+        data: &mut Self::Data,
+        action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        let Action::Key(key) = action;
+
+        let input = data.quick_input.as_mut().unwrap();
+        let search = &mut data.search.as_mut().unwrap();
+        let list = &mut search.list;
+
+        let mut send = false;
+        if let KeyCode::Char(c) = key.code {
+            input.text.push(c);
+            send = true;
+        }
+        if key.code == KeyCode::Backspace {
+            input.text.pop();
+            send = true;
+        }
+
+        if send {
+            search.filter.title = input.text.clone();
+            list.apply_filter(&data.data, &search.filter);
+        }
+
+        if key.code == KeyCode::Enter {
+            return self.pop(list.selection());
+        }
+
+        if key.code == KeyCode::Up {
+            list.selection = list.selection.saturating_sub(1);
+        }
+        if key.code == KeyCode::Down && list.selection + 1 < list.tasks.len() {
+            list.selection += 1;
+        }
+
+        if key.code == KeyCode::Esc {
+            return self.pop(None);
+        }
+
+        ActResult::Nothing
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        let mut list = TaskList::default().title(&self.title);
+        list.apply_filter(&data.data, &Filter::default());
+        data.quick_input = Some(QuickInput::new("Search"));
+        data.search = Some(Search {
+            filter: Filter::default(),
+            list,
+        });
+        ActResult::Nothing
+    }
+
+    fn on_exit(&mut self, data: &mut Self::Data) {
+        data.quick_input = None;
+        data.search = None;
+    }
+}
+
+struct QuickCreateState;
+
+impl State for QuickCreateState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = Option<String>;
+    type Return = ();
+
+    fn act(
+        &mut self,
+        _data: &mut Self::Data,
+        _action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        panic!("QuickCreateState shouldn't receive actions");
+    }
+
+    fn resume(
+        &mut self,
+        data: &mut Self::Data,
+        value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        if let Some(text) = value {
+            let task = data.data.store.new_task();
+            task.title = text;
+            data.tasklist.tasks.push(task.id);
+            data.tasklist.selection = data.tasklist.tasks.len() - 1;
+        }
+
+        self.pop(())
+    }
+
+    fn on_enter(&mut self, _data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        self.push(QuickInputState::new("Title"))
+    }
+}
+
+struct SetDescriptionState(TaskId);
+
+impl State for SetDescriptionState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = Option<String>;
+    type Return = ();
+
+    fn act(
+        &mut self,
+        _data: &mut Self::Data,
+        _action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        panic!("SetDescriptionState shouldn't receive actions");
+    }
+
+    fn resume(
+        &mut self,
+        data: &mut Self::Data,
+        value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        if let Some(text) = value {
+            let id = self.0;
+            let task = data.data.store.get_task_mut(id);
+            task.description = text;
+        }
+
+        self.pop(())
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        let id = self.0;
+        let task = data.data.store.get_task_mut(id);
+        self.push(QuickInputState::new("Description").text(task.description.clone()))
+    }
+}
+
+struct SetFilterState;
+
+impl State for SetFilterState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = Option<String>;
+    type Return = ();
+
+    fn act(
+        &mut self,
+        _data: &mut Self::Data,
+        _action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        panic!("SetFilterState shouldn't receive actions");
+    }
+
+    fn resume(
+        &mut self,
+        data: &mut Self::Data,
+        value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        if let Some(text) = value {
+            if text == "Title" {
+                return self.replace(SetFilterTitleState);
+            }
+            if text == "Todo" {
+                data.filter.status = Some(task::Status::Todo);
+            }
+            if text == "Done" {
+                data.filter.status = Some(task::Status::Done);
+            }
+            if text == "Clear" {
+                data.filter = Filter::default();
+            }
+            data.tasklist.apply_filter(&data.data, &data.filter);
+        }
+
+        self.pop(())
+    }
+
+    fn on_enter(&mut self, _data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        self.push(QuickSelectState::new(
+            "Filter".into(),
+            vec![('t', "Title"), ('d', "Todo"), ('D', "Done"), ('c', "Clear")],
+        ))
+    }
+}
+
+struct SetFilterTitleState;
+
+impl State for SetFilterTitleState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = Option<String>;
+    type Return = ();
+
+    fn act(
+        &mut self,
+        _data: &mut Self::Data,
+        _action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        panic!("SetFilterTitleState shouldn't receive actions");
+    }
+
+    fn resume(
+        &mut self,
+        _data: &mut Self::Data,
+        _value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        self.pop(())
+    }
+
+    fn on_yield(
+        &mut self,
+        data: &mut Self::Data,
+        value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        if let Some(text) = value {
+            data.filter.title = text;
+            data.tasklist.apply_filter(&data.data, &data.filter);
+        }
+
+        ActResult::Nothing
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        self.push(
+            QuickInputState::new("Filter [Title]")
+                .text(data.filter.title.clone())
+                .continuous(true),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct QuickInputState {
+    title: String,
+    continuous: bool,
+    text: String,
+}
+
+impl QuickInputState {
+    fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            text: String::new(),
+            continuous: false,
+        }
+    }
+
+    fn text(mut self, text: String) -> Self {
+        self.text = text;
+        self
+    }
+
+    fn continuous(mut self, v: bool) -> Self {
+        self.continuous = v;
+        self
+    }
+}
+
+impl State for QuickInputState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = ();
+    type Return = Option<String>;
+
+    fn act(
+        &mut self,
+        data: &mut Self::Data,
+        action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        let Action::Key(key) = action;
+
+        let input = data.quick_input.as_mut().unwrap();
+
+        let mut send = false;
+        if let KeyCode::Char(c) = key.code {
+            input.text.push(c);
+            send = true;
+        }
+        if key.code == KeyCode::Backspace {
+            input.text.pop();
+            send = true;
+        }
+
+        if send && self.continuous {
+            return self.do_yield(Some(input.text.clone()));
+        } else if key.code == KeyCode::Enter {
+            return self.pop(Some(input.text.clone()));
+        }
+
+        if key.code == KeyCode::Esc {
+            return self.pop(None);
+        }
+
+        ActResult::Nothing
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        data.quick_input = Some(QuickInput::new(&self.title).text(self.text.clone()));
+        ActResult::Nothing
+    }
+
+    fn on_exit(&mut self, data: &mut Self::Data) {
+        data.quick_input = None;
+    }
+}
+
+#[derive(Debug, Default)]
+struct QuickSelectState {
+    title: String,
+    choices: Vec<(char, String)>,
+}
+
+impl QuickSelectState {
+    fn new(title: String, choices: impl IntoIterator<Item = (char, impl Into<String>)>) -> Self {
+        Self {
+            title,
+            choices: choices.into_iter().map(|x| (x.0, x.1.into())).collect(),
+        }
+    }
+}
+
+impl State for QuickSelectState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = ();
+    type Return = Option<String>;
+
+    fn act(
+        &mut self,
+        data: &mut Self::Data,
+        action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        let Action::Key(key) = action;
+
+        let input = data.quick_select.as_mut().unwrap();
+
+        if let KeyCode::Char(c) = key.code {
+            if let Some(choice) = input.choices.iter().find(|x| x.0 == c) {
+                return self.pop(Some(choice.1.clone()));
+            }
+        }
+
+        if key.code == KeyCode::Esc {
+            return self.pop(None);
+        }
+
+        ActResult::Nothing
+    }
+
+    fn on_enter(&mut self, data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        data.quick_select = Some(QuickSelect::new(&self.title).choices(self.choices.clone()));
+
+        ActResult::Nothing
+    }
+    fn on_exit(&mut self, data: &mut Self::Data) {
+        data.quick_select = None;
+    }
 }
 
 #[derive(Debug, Default)]
 struct Tasker {
     tasklist: TaskList,
-    state: AppState,
+    quick_input: Option<QuickInput>,
+    quick_select: Option<QuickSelect>,
+    search: Option<Search>,
     pane: Pane,
     data: AppData,
     filter: Filter,
-    commands: Vec<Command>,
 }
 
 impl Tasker {
-    fn execute_command(&mut self, done: bool) {
-        match self.commands.get(0) {
-            Some(Command::QuickNew) => {
-                if let Some(Command::Text(text)) = self.commands.get(1) {
-                    let task = self.data.store.new_task();
-                    task.title = text.clone();
-                    self.tasklist.tasks.push(task.id);
-                    self.tasklist.selection = self.tasklist.tasks.len() - 1;
-                }
-            }
-            Some(Command::SetDescription(id)) => {
-                if let Some(Command::Text(text)) = self.commands.get(1) {
-                    let task = self.data.store.get_task_mut(*id);
-                    task.description = text.clone();
-                }
-            }
-            Some(Command::SetFilter) => {
-                if let Some(Command::Text(text)) = self.commands.get(1) {
-                    self.filter.title = text.clone();
-                    self.tasklist.apply_filter(&self.data, &self.filter);
-                }
-            }
-            Some(Command::SelectFilter) => {
-                if let Some(Command::Text(text)) = self.commands.get(1) {
-                    if text == "Title" {
-                        self.commands.clear();
-                        self.commands.push(Command::SetFilter);
-                        self.state = AppState::Input(
-                            QuickInput::new("Filter [Title]")
-                                .text(self.filter.title.clone())
-                                .continuous(),
-                        );
-                        return;
-                    }
-                    if text == "Todo" {
-                        self.filter.status = Some(task::Status::Todo);
-                    }
-                    if text == "Done" {
-                        self.filter.status = Some(task::Status::Done);
-                    }
-                    if text == "Clear" {
-                        self.filter = Filter::default();
-                    }
-                    self.tasklist.apply_filter(&self.data, &self.filter);
-                    self.state = AppState::Normal;
-                }
-            }
-            Some(Command::AddLink) => {
-                if let Some(Command::Text(text)) = self.commands.get(1) {
-                    if !done {
-                        if let AppState::Search(search) = &mut self.state {
-                            search.filter.title = text.clone();
-                            search.list.apply_filter(&self.data, &search.filter);
-                        }
-                    } else if let AppState::Search(search) = &mut self.state {
-                        if let Some(id) = search.list.selection() {
-                            if let Pane::OneTask(view) = &mut self.pane {
-                                let task = self.data.store.get_task_mut(view.task_id);
-                                task.links.push(id);
-                                let other_task = self.data.store.get_task_mut(id);
-                                other_task.links.push(view.task_id);
-                                view.link_list.tasks.push(id);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        if done {
-            self.commands.clear();
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) {
-        match &mut self.state {
-            state @ AppState::Normal => {
-                match key.code {
-                    KeyCode::Char('n') => {
-                        self.commands.push(Command::QuickNew);
-                        *state = AppState::Input(QuickInput::new("Title"));
-                    }
-                    _ => {}
-                }
-                if matches!(self.pane, Pane::Main) {
-                    match key.code {
-                        KeyCode::Char('f') => {
-                            self.commands.push(Command::SelectFilter);
-                            *state = AppState::Select(QuickSelect::new("Filter").choices(vec![
-                                ('t', "Title"),
-                                ('d', "Todo"),
-                                ('D', "Done"),
-                                ('c', "Clear"),
-                            ]));
-                        }
-                        KeyCode::Up => {
-                            self.tasklist.selection = self.tasklist.selection.saturating_sub(1);
-                        }
-                        KeyCode::Down => {
-                            if self.tasklist.selection + 1 < self.tasklist.tasks.len() {
-                                self.tasklist.selection += 1;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if let Some(id) = self.tasklist.selection() {
-                                self.pane = Pane::OneTask(TaskView::new(id, &self.data, true));
-                            }
-                        }
-                        KeyCode::Char(' ') => {
-                            if let Some(id) = self.tasklist.selection() {
-                                let task = self.data.store.get_task_mut(id);
-                                task.toggle_status();
-                            }
-                        }
-                        KeyCode::Char('m') => {
-                            let task = self.data.store.new_task();
-                            task.title = task.id.id().to_string();
-                            self.tasklist.tasks.push(task.id);
-                            self.tasklist.selection = self.tasklist.tasks.len() - 1;
-                        }
-                        KeyCode::Char('e') => {
-                            if let Some(id) = self.tasklist.selection() {
-                                let task = self.data.store.get_task(id);
-                                self.commands.push(Command::SetDescription(id));
-                                *state = AppState::Input(
-                                    QuickInput::new("Description").text(task.description.clone()),
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                } else if let Pane::OneTask(view) = &mut self.pane {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.pane = Pane::Main;
-                        }
-                        KeyCode::Up => {
-                            view.link_list.selection = view.link_list.selection.saturating_sub(1);
-                        }
-                        KeyCode::Down => {
-                            if view.link_list.selection + 1 < view.link_list.tasks.len() {
-                                view.link_list.selection += 1;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if let Some(id) = view.link_list.selection() {
-                                self.pane = Pane::OneTask(TaskView::new(id, &self.data, true));
-                            }
-                        }
-                        KeyCode::Char(' ') => {
-                            let task = self.data.store.get_task_mut(view.task_id);
-                            task.toggle_status();
-                        }
-                        KeyCode::Char('l') => {
-                            self.commands.push(Command::AddLink);
-                            let mut list = TaskList::default().title("Link a task");
-                            list.apply_filter(&self.data, &Filter::default());
-                            self.state = AppState::Search(Search {
-                                filter: Filter::default(),
-                                list,
-                                input: QuickInput::new("Search").continuous(),
-                            })
-                        }
-                        KeyCode::Char('e') => {
-                            let task = self.data.store.get_task(view.task_id);
-                            self.commands.push(Command::SetDescription(view.task_id));
-                            *state = AppState::Input(
-                                QuickInput::new("Description").text(task.description.clone()),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            AppState::Input(input) => {
-                let mut send = false;
-                if let KeyCode::Char(c) = key.code {
-                    input.text.push(c);
-                    send = true;
-                }
-                if key.code == KeyCode::Backspace {
-                    input.text.pop();
-                    send = true;
-                }
-                if send && input.continuous {
-                    if let Some(Command::Text(_)) = self.commands.last() {
-                        self.commands.pop();
-                    }
-                    self.commands.push(Command::Text(input.text.clone()));
-                    self.execute_command(false);
-                } else if key.code == KeyCode::Enter {
-                    self.commands.push(Command::Text(input.text.clone()));
-                    self.execute_command(true);
-                    self.state = AppState::Normal;
-                }
-
-                if key.code == KeyCode::Esc {
-                    self.commands.clear();
-                    self.state = AppState::Normal;
-                }
-            }
-            AppState::Search(Search { input, list, .. }) => {
-                let mut send = false;
-                if let KeyCode::Char(c) = key.code {
-                    input.text.push(c);
-                    send = true;
-                }
-                if key.code == KeyCode::Backspace {
-                    input.text.pop();
-                    send = true;
-                }
-
-                if key.code == KeyCode::Up {
-                    list.selection = list.selection.saturating_sub(1);
-                }
-                if key.code == KeyCode::Down {
-                    if list.selection + 1 < list.tasks.len() {
-                        list.selection += 1;
-                    }
-                }
-
-                if send && input.continuous {
-                    if let Some(Command::Text(_)) = self.commands.last() {
-                        self.commands.pop();
-                    }
-                    self.commands.push(Command::Text(input.text.clone()));
-                    self.execute_command(false);
-                } else if key.code == KeyCode::Enter {
-                    self.commands.push(Command::Text(input.text.clone()));
-                    self.execute_command(true);
-                    self.state = AppState::Normal;
-                }
-
-                if key.code == KeyCode::Esc {
-                    self.commands.clear();
-                    self.state = AppState::Normal;
-                }
-            }
-            AppState::Select(input) => {
-                if let KeyCode::Char(c) = key.code {
-                    if let Some(choice) = input.choices.iter().find(|x| x.0 == c) {
-                        self.commands.push(Command::Text(choice.1.clone()));
-                        self.execute_command(true);
-                    }
-                }
-                if key.code == KeyCode::Esc {
-                    self.commands.clear();
-                    self.state = AppState::Normal;
-                }
-            }
-        }
-    }
-
     fn show(&mut self, terminal: &mut Terminal<impl Backend>) -> CResult<()> {
         terminal.draw(|f| {
-            let constraints = if let AppState::Search(input) = &self.state {
+            let constraints = if let Some(_search) = &mut self.search {
                 vec![
                     Constraint::Min(2),
                     Constraint::Percentage(50),
@@ -556,23 +814,20 @@ impl Tasker {
                 }
             }
 
-            if let AppState::Input(input) = &self.state {
+            if let Some(input) = &self.quick_input {
+                let block = *chunks.last().unwrap();
                 let (text, pos) = input.show(&self.data);
-                f.render_widget(text, chunks[1]);
-                f.set_cursor(chunks[1].left() + pos, chunks[1].top());
+                f.render_widget(text, block);
+                f.set_cursor(block.left() + pos, block.top());
             }
 
-            if let AppState::Select(input) = &self.state {
+            if let Some(input) = &self.quick_select {
                 let text = input.show(&self.data);
                 f.render_widget(text, chunks[1]);
             }
 
-            if let AppState::Search(search) = &mut self.state {
+            if let Some(search) = &mut self.search {
                 search.list.show(&self.data, f, chunks[1]);
-
-                let (text, pos) = search.input.show(&self.data);
-                f.render_widget(text, chunks[2]);
-                f.set_cursor(chunks[2].left() + pos, chunks[2].top());
             }
         })?;
 
@@ -582,6 +837,7 @@ impl Tasker {
 
 fn event_loop(mut terminal: Terminal<impl Backend>) -> CResult<()> {
     let mut tasker = Tasker::default();
+    let mut machine = Machine::new(NormalState);
     tasker.data.window_size = terminal::size()?;
     loop {
         tasker.show(&mut terminal)?;
@@ -601,7 +857,7 @@ fn event_loop(mut terminal: Terminal<impl Backend>) -> CResult<()> {
                     break;
                 }
                 Event::Key(key) => {
-                    tasker.handle_key(key);
+                    machine.act(&mut tasker, Action::Key(key));
                 }
                 _ => {}
             }
