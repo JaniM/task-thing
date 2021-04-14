@@ -86,25 +86,23 @@ pub trait State {
 }
 
 pub trait StateTools: State {
-    fn transition<I, R>(
+    fn transition(
         &self,
-        state: impl State<Action = Self::Action, Data = Self::Data, Input = I, Return = R> + 'static,
+        state: impl State<Action = Self::Action, Data = Self::Data> + 'static,
     ) -> ActResult<Self::Action, Self::Data> {
         PrivilegedActResult::To(Box::new(state) as _).into()
     }
 
-    fn replace<I>(
+    fn replace(
         &self,
-        state: impl State<Action = Self::Action, Data = Self::Data, Input = I, Return = Self::Return>
-            + 'static,
+        state: impl State<Action = Self::Action, Data = Self::Data, Return = Self::Return> + 'static,
     ) -> ActResult<Self::Action, Self::Data> {
         PrivilegedActResult::Replace(Box::new(state) as _).into()
     }
 
-    fn push<I>(
+    fn push(
         &self,
-        state: impl State<Action = Self::Action, Data = Self::Data, Input = I, Return = Self::Input>
-            + 'static,
+        state: impl State<Action = Self::Action, Data = Self::Data, Return = Self::Input> + 'static,
     ) -> ActResult<Self::Action, Self::Data> {
         PrivilegedActResult::Push(Box::new(state) as _).into()
     }
