@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
+
 use tui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -121,10 +124,12 @@ impl TaskView {
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(horizontal[0]);
 
-        let text = vec![Spans::from(vec![
-            Span::from("Status: "),
-            status_to_span(task.status),
-        ])];
+        let mut spans = vec![Span::from("Status: "), status_to_span(task.status)];
+        for _ in 0..task.pomodoros {
+            spans.push(Span::from(" #"));
+        }
+
+        let text = vec![Spans::from(spans)];
         let text = Paragraph::new(text);
         frame.render_widget(text, chunks[0]);
 
@@ -198,6 +203,55 @@ impl QuickSelect {
         for (key, text) in &self.choices {
             spans.push(Span::raw(format!("[{}] {} ", key, text)));
         }
+        Paragraph::new(vec![Spans::from(spans)])
+    }
+}
+
+pub(crate) struct Timer {
+    pub(crate) title: Cow<'static, str>,
+    pub(crate) target: Instant,
+    pub(crate) on_done: Box<dyn Fn(&mut AppData)>,
+    pub(crate) triggered: bool,
+}
+
+impl Timer {
+    pub(crate) fn trigger_in(
+        title: impl Into<Cow<'static, str>>,
+        dur: Duration,
+        on_done: impl Fn(&mut AppData) + 'static,
+    ) -> Self {
+        let target = Instant::now() + dur;
+        Self {
+            title: title.into(),
+            target,
+            on_done: Box::new(on_done) as _,
+            triggered: false,
+        }
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        let now = Instant::now();
+        self.target < now
+    }
+
+    pub(crate) fn show(&self, _data: &AppData) -> Paragraph {
+        let now = Instant::now();
+        if self.target < now {
+            let dur = now - self.target;
+            return if dur.as_secs() % 2 == 0 {
+                Paragraph::new(vec![Spans::from(format!("{} | DONE ", &self.title))])
+            } else {
+                Paragraph::new(vec![Spans::from(format!("{} |     ", &self.title))])
+            };
+        }
+        let dur = self.target - now;
+        let time = dur.as_secs();
+        let minutes = time / 60;
+        let seconds = time % 60;
+        let spans = vec![Span::from(format!(
+            "{} | {:0>2}:{:0>2}",
+            &self.title, minutes, seconds
+        ))];
         Paragraph::new(vec![Spans::from(spans)])
     }
 }

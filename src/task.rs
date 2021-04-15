@@ -28,6 +28,7 @@ pub struct Task {
     pub title: String,
     pub description: String,
     pub status: Status,
+    pub pomodoros: i32,
     pub links: Vec<TaskId>,
 }
 
@@ -56,6 +57,7 @@ impl TaskStore {
             title: String::new(),
             description: String::new(),
             status: Status::default(),
+            pomodoros: 0,
             links: Default::default(),
         };
         self.tasks.insert(id, task);

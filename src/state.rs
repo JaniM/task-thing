@@ -2,7 +2,7 @@ pub(crate) mod dialogs;
 
 use crate::{
     automaton::*,
-    components::TaskView,
+    components::{TaskView, Timer},
     task::{self, Filter, TaskId},
     Action, Pane, Tasker,
 };
@@ -59,6 +59,11 @@ impl State for NormalState {
             KeyCode::Char('e') => {
                 if let Some(id) = data.tasklist.selection() {
                     return self.push(SetDescriptionState(id));
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(id) = data.tasklist.selection() {
+                    return self.push(SetPomodoroState(id));
                 }
             }
             _ => {}
@@ -343,5 +348,82 @@ impl State for SetFilterTitleState {
                 .text(data.filter.title.clone())
                 .continuous(true),
         )
+    }
+}
+
+pub(crate) struct SetPomodoroState(TaskId);
+
+impl State for SetPomodoroState {
+    type Action = Action;
+    type Data = Tasker;
+    type Input = Option<String>;
+    type Return = ();
+
+    fn act(
+        &mut self,
+        _data: &mut Self::Data,
+        _action: Self::Action,
+    ) -> ActResult<Self::Action, Self::Data> {
+        panic!("SetPomodoroState shouldn't receive actions");
+    }
+
+    fn resume(
+        &mut self,
+        data: &mut Self::Data,
+        value: Self::Input,
+    ) -> ActResult<Self::Action, Self::Data> {
+        let id = self.0;
+        if let Some(text) = value {
+            if text == "Start" {
+                data.timer = Some(Timer::trigger_in(
+                    "WORK",
+                    std::time::Duration::from_secs(60 * 25),
+                    move |data| {
+                        let task = data.store.get_task_mut(id);
+                        task.pomodoros += 1;
+                    },
+                ));
+            }
+            if text == "Break 5m" {
+                data.timer = Some(Timer::trigger_in(
+                    "BREAK",
+                    std::time::Duration::from_secs(60 * 5),
+                    |_| {},
+                ));
+            }
+            if text == "Break 10m" {
+                data.timer = Some(Timer::trigger_in(
+                    "BREAK",
+                    std::time::Duration::from_secs(60 * 10),
+                    |_| {},
+                ));
+            }
+            if text == "Test" {
+                data.timer = Some(Timer::trigger_in(
+                    "TEST",
+                    std::time::Duration::from_secs(5),
+                    |_| {},
+                ));
+            }
+            if text == "Clear" {
+                data.timer = None;
+            }
+            data.tasklist.apply_filter(&data.data, &data.filter);
+        }
+
+        self.pop(())
+    }
+
+    fn on_enter(&mut self, _data: &mut Self::Data) -> ActResult<Self::Action, Self::Data> {
+        self.push(QuickSelectState::new(
+            "Pomodoro".into(),
+            vec![
+                ('p', "Start"),
+                ('b', "Break 5m"),
+                ('B', "Break 10m"),
+                ('t', "Test"),
+                ('c', "Clear"),
+            ],
+        ))
     }
 }

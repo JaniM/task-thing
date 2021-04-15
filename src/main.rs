@@ -3,7 +3,11 @@ mod components;
 mod state;
 mod task;
 
-use std::{io::stdout, time::Duration};
+use std::{
+    fs::File,
+    io::{stdout, BufReader},
+    time::Duration,
+};
 
 use crossterm::{
     cursor,
@@ -13,11 +17,14 @@ use crossterm::{
     Result as CResult,
 };
 
+use rodio::Sink;
 use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
     Terminal,
 };
+
+use rodio::{Decoder, OutputStream};
 
 use automaton::Machine;
 use components::*;
@@ -48,22 +55,45 @@ impl Default for Pane {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum Action {
     Key(KeyEvent),
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Tasker {
     pub(crate) tasklist: TaskList,
     pub(crate) quick_input: Option<QuickInput>,
     pub(crate) quick_select: Option<QuickSelect>,
     pub(crate) search: Option<Search>,
+    pub(crate) timer: Option<Timer>,
     pub(crate) pane: Pane,
     pub(crate) data: AppData,
     pub(crate) filter: Filter,
+    audio: Option<(OutputStream, rodio::OutputStreamHandle, Sink)>,
 }
 
 impl Tasker {
+    fn update(&mut self) {
+        if let Some(timer) = &mut self.timer {
+            if timer.is_done() && !timer.triggered {
+                timer.triggered = true;
+                (timer.on_done)(&mut self.data);
+                let (_, _stream_handle, sink) = self.audio.get_or_insert_with(|| {
+                    let (s, h) = OutputStream::try_default().unwrap();
+                    let sink = Sink::try_new(&h).unwrap();
+                    (s, h, sink)
+                });
+                // Load a sound from a file, using a path relative to Cargo.toml
+                let file = BufReader::new(File::open("data/bell.wav").unwrap());
+                // Decode that sound file into a source
+                let source = Decoder::new(file).unwrap();
+                sink.set_volume(0.3);
+                sink.append(source);
+            }
+        }
+    }
+
     fn show(&mut self, terminal: &mut Terminal<impl Backend>) -> CResult<()> {
         terminal.draw(|f| {
             let constraints = if let Some(_search) = &mut self.search {
@@ -111,6 +141,15 @@ impl Tasker {
             if let Some(search) = &mut self.search {
                 search.list.show(&self.data, f, chunks[1]);
             }
+
+            if let Some(timer) = &self.timer {
+                let mut block = *chunks.last().unwrap();
+                let offset = timer.title.len() as u16 + 8 + 3;
+                block.x = block.width - offset;
+                block.width = offset;
+                let text = timer.show(&self.data);
+                f.render_widget(text, block);
+            }
         })?;
 
         Ok(())
@@ -122,6 +161,7 @@ fn event_loop(mut terminal: Terminal<impl Backend>) -> CResult<()> {
     let mut machine = Machine::new(NormalState);
     tasker.data.window_size = terminal::size()?;
     loop {
+        tasker.update();
         tasker.show(&mut terminal)?;
         // Wait up to 1s for another event
         if poll(Duration::from_millis(1_000))? {

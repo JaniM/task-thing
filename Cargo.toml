@@ -10,3 +10,4 @@ edition = "2018"
 crossterm = "0.19"
 tui = { version = "0.14", default-features = false, features = ['crossterm'] }
 unicode-segmentation = "1.7.1"
+rodio = "0.13"
